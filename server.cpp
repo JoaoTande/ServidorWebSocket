@@ -9,15 +9,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>  // Changed from openssl/sha.h to modern OpenSSL
 #include <vector>
-#include <string>
 
 const int PORT = 8080;
 const int BUFFER_SIZE = 4096;
 std::mutex cout_mutex;
 
-// Constantes do protocolo WebSocket
+// WebSocket protocol constants
 const std::string WS_MAGIC_KEY = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 static const std::string base64_chars = 
@@ -43,16 +42,39 @@ std::string base64_encode(const std::string &in) {
 
 std::string calculate_accept_key(const std::string &client_key) {
     std::string combined = client_key + WS_MAGIC_KEY;
-    unsigned char sha1[SHA_DIGEST_LENGTH];
-    SHA1((const unsigned char*)combined.c_str(), combined.length(), sha1);
-    return base64_encode(std::string((char*)sha1, SHA_DIGEST_LENGTH));
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len;
+
+    // Modern OpenSSL 3.0 approach
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        throw std::runtime_error("Failed to create EVP_MD_CTX");
+    }
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha1(), NULL) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to initialize SHA-1 digest");
+    }
+
+    if (EVP_DigestUpdate(mdctx, combined.c_str(), combined.length()) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to update digest");
+    }
+
+    if (EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to finalize digest");
+    }
+
+    EVP_MD_CTX_free(mdctx);
+    return base64_encode(std::string((char*)hash, hash_len));
 }
 
 void handle_websocket(int clientSocket) {
     char buffer[BUFFER_SIZE];
     memset(buffer, 0, BUFFER_SIZE);
     
-    // Recebe handshake inicial
+    // Receive initial handshake
     int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
     if (bytesReceived <= 0) {
         close(clientSocket);
@@ -61,22 +83,30 @@ void handle_websocket(int clientSocket) {
 
     std::string request(buffer, bytesReceived);
     
-    // Verifica se é um handshake WebSocket
+    // Check if this is a WebSocket handshake
     size_t key_pos = request.find("Sec-WebSocket-Key:");
     if (key_pos == std::string::npos) {
         close(clientSocket);
         return;
     }
 
-    // Extrai a chave do cliente
+    // Extract client key
     size_t key_end = request.find("\r\n", key_pos);
     std::string client_key = request.substr(key_pos + 19, key_end - (key_pos + 19));
-    client_key = client_key.substr(0, client_key.find_last_not_of(" \t") + 1);
+    client_key.erase(0, client_key.find_first_not_of(" \t"));
+    client_key.erase(client_key.find_last_not_of(" \t") + 1);
 
-    // Calcula a chave de resposta
-    std::string accept_key = calculate_accept_key(client_key);
+    // Calculate accept key
+    std::string accept_key;
+    try {
+        accept_key = calculate_accept_key(client_key);
+    } catch (const std::exception &e) {
+        std::cerr << "Error calculating accept key: " << e.what() << std::endl;
+        close(clientSocket);
+        return;
+    }
 
-    // Envia resposta de handshake
+    // Send handshake response
     std::string response = 
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
@@ -85,16 +115,15 @@ void handle_websocket(int clientSocket) {
     
     send(clientSocket, response.c_str(), response.size(), 0);
 
-    // Agora em modo WebSocket
+    // Now in WebSocket mode
     while (true) {
         memset(buffer, 0, BUFFER_SIZE);
         bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
         
         if (bytesReceived <= 0) break;
 
-        // Decodifica frame WebSocket (simplificado)
-        // Nota: Implementação real precisa lidar com frames fragmentados, máscaras, etc.
-        if ((buffer[0] & 0x0F) == 0x01) { // Frame de texto
+        // Decode WebSocket frame (simplified)
+        if ((buffer[0] & 0x0F) == 0x01) { // Text frame
             int payload_len = buffer[1] & 0x7F;
             char mask[4];
             char *payload;
@@ -103,12 +132,12 @@ void handle_websocket(int clientSocket) {
                 memcpy(mask, &buffer[2], 4);
                 payload = &buffer[6];
             } else {
-                // Lidar com payloads maiores
+                // Handle larger payloads
                 close(clientSocket);
                 return;
             }
 
-            // Decodifica mensagem
+            // Decode message
             std::string message;
             for (int i = 0; i < payload_len; i++) {
                 message += (payload[i] ^ mask[i % 4]);
@@ -116,10 +145,10 @@ void handle_websocket(int clientSocket) {
 
             {
                 std::lock_guard<std::mutex> lock(cout_mutex);
-                std::cout << "Mensagem recebida: " << message << std::endl;
+                std::cout << "Message received: " << message << std::endl;
             }
 
-            // Prepara resposta (formato WebSocket)
+            // Prepare response (WebSocket format)
             std::string response_msg = message + " -Pong";
             char frame[BUFFER_SIZE];
             frame[0] = 0x81; // Text frame
@@ -136,7 +165,7 @@ void handle_websocket(int clientSocket) {
 int main() {
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket == -1) {
-        std::cerr << "Erro ao criar socket\n";
+        std::cerr << "Error creating socket\n";
         return 1;
     }
 
@@ -146,23 +175,23 @@ int main() {
     serverAddr.sin_addr.s_addr = INADDR_ANY;
 
     int opt = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::cerr << "Erro ao configurar SO_REUSEADDR\n";
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        std::cerr << "Error setting SO_REUSEADDR\n";
     }
 
     if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr))) {
-        std::cerr << "Erro ao fazer bind\n";
+        std::cerr << "Error binding socket\n";
         close(serverSocket);
         return 1;
     }
 
     if (listen(serverSocket, SOMAXCONN) == -1) {
-        std::cerr << "Erro ao escutar\n";
+        std::cerr << "Error listening on socket\n";
         close(serverSocket);
         return 1;
     }
 
-    std::cout << "Servidor WebSocket rodando na porta " << PORT << std::endl;
+    std::cout << "WebSocket server running on port " << PORT << std::endl;
 
     while (true) {
         sockaddr_in clientAddr;
@@ -170,7 +199,7 @@ int main() {
         int clientSocket = accept(serverSocket, (sockaddr*)&clientAddr, &clientAddrSize);
         
         if (clientSocket == -1) {
-            std::cerr << "Erro ao aceitar conexão\n";
+            std::cerr << "Error accepting connection\n";
             continue;
         }
 
